@@ -3,23 +3,23 @@ import yfinance as yf
 import pandas_ta as ta
 import pandas as pd
 import math
+import numpy as np
 import plotly.graph_objects as go
 from transformers import pipeline
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Master AI Trader", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Master AI Trader Pro", page_icon="🧠", layout="wide")
 
 # --- SIDEBAR ---
 st.sidebar.title("🎛️ Steuerzentrale")
 market_mode = st.sidebar.selectbox("Markt / Börse", ["Deutschland (Xetra)", "USA (Original)", "Weltweit"])
-ticker_input = st.sidebar.text_input("Symbol", value="PYPL").upper()
+ticker_input = st.sidebar.text_input("Symbol", value="LIN").upper()
 strategy_mode = st.sidebar.selectbox("Strategie", ["Swing Trading (Kurz)", "Value Investing (Langzeit)"])
 
 st.sidebar.divider()
 st.sidebar.subheader("🧠 Bot-Persönlichkeit")
-# NEU: Der Aggressivitäts-Regler
 aggro_mode = st.sidebar.select_slider(
-    "Wie risikofreudig soll der Bot entscheiden?",
+    "Risikobereitschaft:",
     options=["Sicherheits-Fanatiker 🛡️", "Ausgewogen ⚖️", "Risiko-Freudig (Degen) 🚀"],
     value="Ausgewogen ⚖️"
 )
@@ -77,8 +77,14 @@ def fetch_data(symbol, period):
         df['BB_UPPER'] = bands[upper]
         df['BB_LOWER'] = bands[lower]
         
-        return df
-    except: return None
+        # SIGMA (Volatilität) Berechnung
+        # Wir berechnen die Standardabweichung der täglichen Returns
+        df['Returns'] = df['Close'].pct_change()
+        # Annualisierte Volatilität (Sigma) = StdDev * Wurzel(252 Handelstage)
+        sigma = df['Returns'].std() * (252 ** 0.5)
+        
+        return df, sigma
+    except: return None, None
 
 def get_fundamentals(symbol):
     t = yf.Ticker(symbol)
@@ -132,7 +138,7 @@ if st.button("Vollanalyse starten 🚀"):
     with st.spinner(f"Lade KI, Kurse & News für {real_symbol}..."):
         ai_pipeline = load_ai_model()
         period = "2y" if strategy_mode == "Value Investing (Langzeit)" else "1y"
-        df = fetch_data(real_symbol, period)
+        df, sigma_val = fetch_data(real_symbol, period)
         fund = get_fundamentals(real_symbol)
         ai_stimmung, ai_score, headlines = get_ai_analysis(real_symbol, ai_pipeline)
 
@@ -144,92 +150,138 @@ if st.button("Vollanalyse starten 🚀"):
         
         st.header(f"{fund['name']} ({fund['sector']})")
         
+        # Top KPIs
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Preis", f"{curr_price_eur:.2f} €")
         
+        # Smart Money
         inst_display = f"{fund['institutions']*100:.1f}%" if fund['institutions'] else "n/a"
         k2.metric("Institutionen", inst_display)
         
-        short_display = f"{fund['short_float']*100:.2f}%" if fund['short_float'] else "n/a"
-        k3.metric("Short Quote", short_display)
+        # Sigma Anzeige (NEU)
+        sigma_display = f"{sigma_val*100:.1f}%" if sigma_val else "n/a"
+        # Färbung: Hohes Sigma (>40%) ist rot (riskant), niedriges (<20%) ist grün
+        sigma_color = "normal"
+        if sigma_val and sigma_val > 0.4: sigma_color = "inverse" 
+        k3.metric("Sigma (Volatilität)", sigma_display, "Risiko p.a.", delta_color=sigma_color)
         
         k4.metric("KI Stimmung", ai_stimmung, f"Score: {ai_score}")
 
         st.divider()
 
-        # --- SCORE LOGIK ---
+        # --- SCORE LOGIK MIT PROTOKOLLIERUNG ---
         score = 0
-        reasons_pro = []
-        reasons_con = []
+        score_log = [] # Hier speichern wir alle Details
         
+        # Helper für Log
+        def add_log(criteria, value, points, reason):
+            score_log.append({"Kriterium": criteria, "Wert": value, "Punkte": points, "Erklärung": reason})
+
         # 1. Trend
         if pd.notna(last['SMA200']):
+            trend_val = f"{last['SMA200']:.2f}"
             if last['Close'] > last['SMA200']:
                 score += 1
-                reasons_pro.append("Aufwärtstrend (> SMA200)")
+                add_log("Trend (SMA200)", trend_val, "+1", "Kurs ist über der 200-Tage-Linie (Aufwärtstrend)")
             else:
                 if strategy_mode == "Swing Trading (Kurz)":
                     score -= 0.5
-                    reasons_con.append("Unter SMA200 (Gegen Trend)")
+                    add_log("Trend (SMA200)", trend_val, "-0.5", "Kurs unter Linie (Gegen Trend, bei Swing ok)")
                 else:
                     score -= 2
-                    reasons_con.append("Abwärtstrend (No-Go für Long-Term)")
+                    add_log("Trend (SMA200)", trend_val, "-2.0", "Kurs unter Linie (Bärenmarkt)")
 
         # 2. Bollinger
-        if last['Close'] > last['BB_UPPER']:
-            reasons_con.append("Am oberen Band (Überhitzt)")
-            if strategy_mode == "Swing Trading (Kurz)": score -= 2
-        elif last['Close'] <= last['BB_LOWER'] * 1.02: # 2% Toleranz für bessere Treffer!
-            reasons_pro.append("Am unteren Band (Rebound Chance)")
-            if strategy_mode == "Swing Trading (Kurz)": score += 3 
-            else: score += 1
+        bb_low = last['BB_LOWER']
+        bb_up = last['BB_UPPER']
+        
+        if last['Close'] > bb_up:
+            if strategy_mode == "Swing Trading (Kurz)": 
+                score -= 2
+                add_log("Bollinger Band", "Oben", "-2.0", "Kurs durchbricht oberes Band (Überkauft)")
+            else:
+                add_log("Bollinger Band", "Oben", "0", "Kurs ist hoch (für Value weniger relevant)")
+                
+        elif last['Close'] <= bb_low * 1.02: 
+            if strategy_mode == "Swing Trading (Kurz)": 
+                score += 3
+                add_log("Bollinger Band", "Unten", "+3.0", "Kurs am unteren Band (Perfekter Rebound Einstieg)")
+            else: 
+                score += 1
+                add_log("Bollinger Band", "Unten", "+1.0", "Kurs ist günstig (am unteren Band)")
+        else:
+            add_log("Bollinger Band", "Mitte", "0", "Kurs läuft innerhalb der Bänder")
 
         # 3. RSI
-        if last['RSI'] < 35: # Schwelle erhöht auf 35 für mehr Signale
-            reasons_pro.append(f"RSI günstig ({last['RSI']:.0f})")
+        rsi_val = f"{last['RSI']:.1f}"
+        if last['RSI'] < 35:
             score += 1
+            add_log("RSI", rsi_val, "+1.0", "RSI ist niedrig (Überverkauft)")
         elif last['RSI'] > 70:
-            reasons_con.append(f"RSI Hype ({last['RSI']:.0f})")
             score -= 1
+            add_log("RSI", rsi_val, "-1.0", "RSI ist zu hoch (Überkauft)")
+        else:
+            add_log("RSI", rsi_val, "0", "RSI ist neutral")
 
         # 4. KI
         if ai_stimmung == "Positiv":
             score += 1
-            reasons_pro.append("KI News sind positiv")
+            add_log("KI News", "Positiv", "+1.0", "KI bewertet Schlagzeilen positiv")
         elif ai_stimmung == "Negativ":
             score -= 1
-            reasons_con.append("KI News sind negativ")
+            add_log("KI News", "Negativ", "-1.0", "KI bewertet Schlagzeilen negativ")
+        else:
+            add_log("KI News", "Neutral", "0", "Keine eindeutige Stimmung in den News")
 
-        c_pro, c_con = st.columns(2)
-        with c_pro:
-            st.success("✅ BULLISH")
-            for r in reasons_pro: st.write(f"• {r}")
-        with c_con:
-            st.error("❌ BEARISH")
-            for r in reasons_con: st.write(f"• {r}")
-            
-        with st.expander("📰 News Details"):
-            for h in headlines: st.write(f"- {h}")
+        # 5. Fundamental (Nur bei Investing)
+        if strategy_mode == "Value Investing (Langzeit)":
+            peg = fund['peg']
+            if peg is not None and 0 < peg < 1.5:
+                score += 1
+                add_log("PEG Ratio", f"{peg:.2f}", "+1.0", "Aktie ist fundamental günstig bewertet")
+            elif peg > 2.5:
+                score -= 1
+                add_log("PEG Ratio", f"{peg:.2f}", "-1.0", "Aktie ist fundamental teuer")
 
-        st.subheader("📊 Profi-Chart")
-        fig = go.Figure(data=[go.Candlestick(x=df.index,
-                        open=df['Open'], high=df['High'],
-                        low=df['Low'], close=df['Close'], name="Kurs")])
-        fig.add_trace(go.Scatter(x=df.index, y=df['BB_UPPER'], line=dict(color='gray', width=1), name="Upper Band"))
-        fig.add_trace(go.Scatter(x=df.index, y=df['BB_LOWER'], line=dict(color='gray', width=1), name="Lower Band"))
-        fig.add_trace(go.Scatter(x=df.index, y=df['SMA200'], line=dict(color='blue', width=2), name="SMA 200"))
-        fig.update_layout(height=500, xaxis_rangeslider_visible=False, template="plotly_dark")
-        st.plotly_chart(fig, use_container_width=True)
-
-        # --- TRADING PLAN & MATHE ---
-        st.divider()
-        st.subheader("📋 Trading Plan & Kennzahlen")
+        # --- ANZEIGE SCORE DETAILS ---
+        col_chart, col_score = st.columns([2, 1])
         
-        # --- DYNAMISCHE SCHWELLENWERTE ---
+        with col_chart:
+            st.subheader("📊 Profi-Chart")
+            fig = go.Figure(data=[go.Candlestick(x=df.index,
+                            open=df['Open'], high=df['High'],
+                            low=df['Low'], close=df['Close'], name="Kurs")])
+            fig.add_trace(go.Scatter(x=df.index, y=df['BB_UPPER'], line=dict(color='gray', width=1), name="Upper Band"))
+            fig.add_trace(go.Scatter(x=df.index, y=df['BB_LOWER'], line=dict(color='gray', width=1), name="Lower Band"))
+            fig.add_trace(go.Scatter(x=df.index, y=df['SMA200'], line=dict(color='blue', width=2), name="SMA 200"))
+            fig.update_layout(height=400, xaxis_rangeslider_visible=False, template="plotly_dark", margin=dict(l=0, r=0, t=0, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+            
+        with col_score:
+            st.subheader(f"🔍 Score-Analyse ({score})")
+            # Schöne Tabelle erstellen
+            df_log = pd.DataFrame(score_log)
+            st.dataframe(df_log, hide_index=True, use_container_width=True)
+            
+            with st.expander("🔢 Alle Rohdaten (Deep Dive)"):
+                st.write(f"**Aktueller Kurs:** {last['Close']:.2f}")
+                st.write(f"**SMA 200:** {last['SMA200']:.2f}")
+                st.write(f"**SMA 50:** {last['SMA50']:.2f}")
+                st.write(f"**RSI:** {last['RSI']:.2f}")
+                st.write(f"**ATR:** {last['ATR']:.2f}")
+                st.write(f"**Bollinger Oben:** {last['BB_UPPER']:.2f}")
+                st.write(f"**Bollinger Unten:** {last['BB_LOWER']:.2f}")
+                st.write(f"**Sigma (Volatilität):** {sigma_val*100:.2f}%")
+
+        st.divider()
+        
+        # --- TRADING PLAN ---
+        st.subheader(f"📋 Trading Plan (in Euro)")
+        
+        # Dynamische Schwellen
         min_score_long = 2.0
         min_score_short = -2.0
         min_crv = 1.2
-        target_strategy = "Konservativ (SMA50)"
         
         if aggro_mode == "Sicherheits-Fanatiker 🛡️":
             min_score_long = 3.0
@@ -239,13 +291,12 @@ if st.button("Vollanalyse starten 🚀"):
             min_score_long = 0.5 
             min_score_short = -0.5
             min_crv = 0.6 
-            target_strategy = "Maximum (Bollinger Band)"
         
         action = "WARTEN"
         tp_orig = last['Close']
         sl_orig = last['Close']
         
-        # --- ZIEL & STOP BESTIMMUNG ---
+        # Logik
         if strategy_mode == "Swing Trading (Kurz)":
             if score >= min_score_long:
                 action = "LONG (Rebound)"
@@ -254,7 +305,6 @@ if st.button("Vollanalyse starten 🚀"):
                 else:
                     tp_orig = last['SMA50'] if pd.notna(last['SMA50']) else last['BB_UPPER']
                 sl_orig = last['BB_LOWER'] * 0.98
-                
             elif score <= min_score_short:
                 action = "SHORT"
                 if "Risiko-Freudig" in aggro_mode:
@@ -263,98 +313,71 @@ if st.button("Vollanalyse starten 🚀"):
                     tp_orig = last['SMA50'] if pd.notna(last['SMA50']) else last['BB_LOWER']
                 sl_orig = last['BB_UPPER'] * 1.02
         else:
-            # Investing
             if score >= (min_score_long + 1):
                 action = "INVESTIEREN"
                 tp_orig = fund['target'] if fund['target'] > 0 else last['Close']*1.3
                 sl_orig = last['Close'] * 0.85
 
-        # Umrechnen in Euro
+        # Umrechnen
         tp_eur = tp_orig * fx_rate
         sl_eur = sl_orig * fx_rate
         curr_eur = last['Close'] * fx_rate
         
-        # --- RISIKO & CHANCE BERECHNUNG ---
         if "SHORT" in action:
-            risk_per_share = sl_eur - curr_eur
-            reward_per_share = curr_eur - tp_eur
-        else: # LONG
-            risk_per_share = curr_eur - sl_eur
-            reward_per_share = tp_eur - curr_eur
+            risk = sl_eur - curr_eur
+            chance = curr_eur - tp_eur
+        else:
+            risk = curr_eur - sl_eur
+            chance = tp_eur - curr_eur
             
-        # Absolute Werte sicherstellen
-        risk_per_share = max(0, risk_per_share)
-        reward_per_share = max(0, reward_per_share)
-
-        # CRV
-        crv = reward_per_share / risk_per_share if risk_per_share > 0 else 0
-        
-        # Stückzahl & Budget
+        crv = chance / risk if risk > 0 else 0
         budget = konto * (risk_pct / 100)
-        qty = math.floor(budget / risk_per_share) if risk_per_share > 0 else 0
+        qty = math.floor(budget / risk) if risk > 0 else 0
         invest_sum = qty * curr_eur
         
-        # Totale Summen
-        total_risk = qty * risk_per_share
-        total_reward = qty * reward_per_share
-        
-        # Prozentuales Potenzial
-        upside_pct = (reward_per_share / curr_eur) * 100
-        downside_pct = (risk_per_share / curr_eur) * 100
-
-        # --- MÜ (ERWARTUNGSWERT) BERECHNUNG ---
-        # Wir schätzen die Wahrscheinlichkeit anhand des Scores
-        # Score 0 = 50% (Zufall), Score 5 = 75% Wahrscheinlichkeit
-        # Wir nutzen den Absolutbetrag von Score, damit Short (negativ) auch zählt
+        # MÜ & SIGMA BERECHNUNG (Das Finale)
         base_prob = 0.50
-        prob_boost = abs(score) * 0.05 # 5% mehr Sicherheit pro Punkt
-        win_prob = min(0.85, base_prob + prob_boost) # Max 85% Wahrscheinlichkeit
+        prob_boost = abs(score) * 0.05 
+        win_prob = min(0.85, base_prob + prob_boost)
         loss_prob = 1.0 - win_prob
         
-        # Mü Formel: (Gewinn * Chance) - (Verlust * Risiko)
+        total_risk = qty * risk
+        total_reward = qty * chance
+        
+        # Mü (Erwartungswert in Euro)
         mu_value = (total_reward * win_prob) - (total_risk * loss_prob)
         
-        # --- ANZEIGE ---
+        # ANZEIGE
         if action == "WARTEN":
             st.warning(f"✋ Keine klare Chance (Score {score} zu niedrig für '{aggro_mode}')")
         elif crv < min_crv:
             st.warning(f"✋ Signal {action}, aber CRV ({crv:.2f}) lohnt nicht.")
-            st.caption(f"Risiko: {downside_pct:.2f}% | Chance: {upside_pct:.2f}%")
         else:
             color = "red" if "SHORT" in action else "green"
             st.markdown(f":{color}[## Empfehlung: {action}]")
-            st.caption(f"Ziel-Strategie: {target_strategy}")
             
-            # 1. Die Hard Facts
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Stop Loss", f"{sl_eur:.2f} €", f"-{downside_pct:.2f}%")
-            c2.metric("Take Profit", f"{tp_eur:.2f} €", f"+{upside_pct:.2f}%")
-            c3.metric("CRV (R-Multiple)", f"{crv:.2f}")
+            c1.metric("Stop Loss", f"{sl_eur:.2f} €")
+            c2.metric("Take Profit", f"{tp_eur:.2f} €")
+            c3.metric("CRV", f"{crv:.2f}")
             c4.metric("Stückzahl", f"{qty}")
             
             st.divider()
             
-            # 2. Die Simulation (Was passiert wenn...?)
-            col_loss, col_win = st.columns(2)
+            # MÜ & SIGMA BOX
+            col_math1, col_math2 = st.columns(2)
             
-            with col_loss:
-                st.error("📉 WENN ES SCHIEF GEHT")
-                st.write(f"Verlust: **-{total_risk:.2f} €**")
-                st.write(f"Wahrscheinlichkeit: {loss_prob*100:.0f}%")
+            with col_math1:
+                st.info(f"🧮 **Erwartungswert (Mü): {mu_value:.2f} €**")
+                st.caption("Durchschnittlicher Gewinn pro Trade bei dieser Strategie.")
                 
-            with col_win:
-                st.success("📈 WENN ES KLAPPT")
-                st.write(f"Gewinn: **+{total_reward:.2f} €**")
-                st.write(f"Wahrscheinlichkeit: {win_prob*100:.0f}% (basierend auf Score)")
-            
-            # 3. Das Mü (Das Fazit für Mathe-Freaks)
-            st.info(f"🧮 **Erwartungswert (Mü): {mu_value:.2f} €**")
-            if mu_value > 0:
-                st.caption("Mathematisch positiver Trade. Das Casino ist auf deiner Seite.")
-            else:
-                st.caption("Achtung: Mathematisch negativer Erwartungswert (Risiko zu hoch für die Chance).")
-            
-            st.write(f"Einsatzkapital: **{invest_sum:.2f} €**")
+            with col_math2:
+                # Sigma des Trades (nicht der Aktie) ist schwer exakt zu berechnen ohne Monte Carlo,
+                # aber wir nehmen das Aktien-Sigma als Risiko-Indikator
+                st.warning(f"⚡ **Risiko-Faktor (Sigma): {sigma_val*100:.1f}%**")
+                st.caption("Jährliche Schwankungsbreite der Aktie. Je höher, desto wilder der Ritt.")
+
+            st.success(f"💰 Investiere: **{invest_sum:.2f} €** (Risiko: {budget:.2f} €)")
 
     else:
         st.error("Fehler beim Laden.")
