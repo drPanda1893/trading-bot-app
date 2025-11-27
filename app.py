@@ -224,17 +224,21 @@ if st.button("Vollanalyse starten 🚀"):
         st.divider()
         st.subheader("📋 Trading Plan (in Euro)")
         
-        # --- DYNAMISCHE SCHWELLENWERTE (Das ist der Trick!) ---
-        # Je aggressiver du bist, desto niedriger ist die Hürde für ein "KAUFEN"
-        min_score_long = 2.0 # Standard
-        min_score_short = -2.0 # Standard
+        # --- DYNAMISCHE SCHWELLENWERTE ---
+        min_score_long = 2.0
+        min_score_short = -2.0
+        min_crv = 1.2
+        target_strategy = "Konservativ (SMA50)" # Info für User
         
         if aggro_mode == "Sicherheits-Fanatiker 🛡️":
             min_score_long = 3.0
             min_score_short = -3.0
+            min_crv = 1.5
         elif aggro_mode == "Risiko-Freudig (Degen) 🚀":
-            min_score_long = 0.5 # Fast alles wird gekauft!
+            min_score_long = 0.5 
             min_score_short = -0.5
+            min_crv = 0.6 # Wir akzeptieren auch schlechtere CRVs
+            target_strategy = "Maximum (Bollinger Band)" # Gieriges Ziel!
         
         action = "WARTEN"
         tp_orig = last['Close']
@@ -242,15 +246,29 @@ if st.button("Vollanalyse starten 🚀"):
         
         if strategy_mode == "Swing Trading (Kurz)":
             if score >= min_score_long:
-                action = "LONG (Kaufen)"
-                tp_orig = last['SMA50'] if pd.notna(last['SMA50']) else last['BB_UPPER']
+                action = "LONG (Rebound)"
+                
+                # ZIEL-LOGIK: Im Degen-Modus zielen wir immer auf das obere Band (Gierig)
+                if "Risiko-Freudig" in aggro_mode:
+                    tp_orig = last['BB_UPPER']
+                else:
+                    # Sonst vorsichtig zur Mitte (SMA50)
+                    tp_orig = last['SMA50'] if pd.notna(last['SMA50']) else last['BB_UPPER']
+                
                 sl_orig = last['BB_LOWER'] * 0.98
+                
             elif score <= min_score_short:
                 action = "SHORT"
-                tp_orig = last['BB_LOWER']
+                
+                if "Risiko-Freudig" in aggro_mode:
+                    tp_orig = last['BB_LOWER'] # Ziel: Ganz nach unten
+                else:
+                    tp_orig = last['SMA50'] if pd.notna(last['SMA50']) else last['BB_LOWER']
+                    
                 sl_orig = last['BB_UPPER'] * 1.02
         else:
-            if score >= (min_score_long + 1): # Investing braucht immer etwas mehr Sicherheit
+            # Investing
+            if score >= (min_score_long + 1):
                 action = "INVESTIEREN"
                 tp_orig = fund['target'] if fund['target'] > 0 else last['Close']*1.3
                 sl_orig = last['Close'] * 0.85
@@ -270,17 +288,16 @@ if st.button("Vollanalyse starten 🚀"):
         budget = konto * (risk_pct / 100)
         qty = math.floor(budget / risk) if risk > 0 else 0
         
-        # CRV Filter lockern im Aggro-Modus
-        min_crv = 1.2
-        if "Risiko-Freudig" in aggro_mode: min_crv = 0.8 # Wir akzeptieren auch schlechtere Wetten
-
+        # Anzeige Logik
         if action == "WARTEN":
-            st.warning(f"✋ Keine Chance (Score {score} ist zu schwach für '{aggro_mode}')")
+            st.warning(f"✋ Keine klare Chance (Score {score} zu niedrig für '{aggro_mode}')")
         elif crv < min_crv:
-            st.warning(f"✋ Signal {action}, aber CRV ({crv:.2f}) lohnt nicht.")
+            st.warning(f"✋ Signal {action} da, aber CRV ({crv:.2f}) ist selbst für Degen zu schlecht.")
+            st.caption(f"Ziel-Strategie: {target_strategy}. Der Kurs ist schon zu nah am Ziel.")
         else:
             color = "red" if "SHORT" in action else "green"
             st.markdown(f":{color}[## Empfehlung: {action}]")
+            st.caption(f"Ziel-Strategie: {target_strategy}")
             
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Stop Loss", f"{sl_eur:.2f} €")
@@ -289,9 +306,6 @@ if st.button("Vollanalyse starten 🚀"):
             c4.metric("Stückzahl", f"{qty}")
             
             st.info(f"💰 Invest: {qty*curr_eur:.2f} € (Risiko: {budget:.2f} €)")
-
-    else:
-        st.error("Fehler beim Laden.")
 
 
 
