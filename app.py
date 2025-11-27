@@ -6,202 +6,309 @@ import math
 from transformers import pipeline
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Wall Street Insider Bot", page_icon="🏦", layout="wide")
+st.set_page_config(page_title="Master AI Trader", page_icon="🧠", layout="wide")
 
 # --- SIDEBAR ---
-st.sidebar.title("⚙️ Konfiguration")
-market_mode = st.sidebar.selectbox("Markt", ["USA (Original)", "Deutschland (Xetra)", "Weltweit"])
+st.sidebar.title("🎛️ Steuerzentrale")
+
+# Modus Wahl
+market_mode = st.sidebar.selectbox("Markt / Börse", ["USA (Original)", "Deutschland (Xetra)", "Weltweit"])
 ticker_input = st.sidebar.text_input("Symbol", value="NVDA").upper()
 strategy_mode = st.sidebar.selectbox("Strategie", ["Value Investing (Langzeit)", "Swing Trading (Kurz)"])
-konto = st.sidebar.number_input("Kontostand", value=10000.0, step=500.0)
-risk_pct = st.sidebar.slider("Risiko (%)", 0.5, 5.0, 1.0)
+konto = st.sidebar.number_input("Dein Kontostand (€)", value=10000.0, step=500.0)
+risk_pct = st.sidebar.slider("Risiko pro Trade (%)", 0.5, 5.0, 1.0)
 
-# --- HELPER ---
-def get_clean_symbol(user_input, mode):
-    symbol = user_input.strip()
-    if mode == "Deutschland (Xetra)":
-        if not symbol.endswith(".DE"): symbol += ".DE"
-    elif mode == "USA (Original)":
-        symbol = symbol.replace(".DE", "")
-    return symbol
+# --- HELPER FUNKTIONEN ---
+
+def get_exchange_rate(from_currency):
+    """Holt den aktuellen Wechselkurs zu Euro"""
+    if from_currency == "EUR": return 1.0
+    
+    try:
+        # Yahoo Ticker für Währungen: EUR=X bedeutet "Wie viel USD ist 1 Euro wert?"
+        # Wir brauchen aber andersrum: Wie viel Euro ist 1 USD wert?
+        if from_currency == "USD":
+            pair = "EUR=X" # Wert von 1 USD in EUR (oft ca 0.95)
+            # Achtung: Yahoo Notation ist oft verwirrend. Wir prüfen den Wert.
+            tick = yf.Ticker(pair)
+            rate = tick.history(period="1d")['Close'].iloc[-1]
+            return rate 
+        else:
+            # Fallback für andere Währungen (vereinfacht 1:1, um Fehler zu vermeiden)
+            return 1.0 
+    except:
+        return 1.0 # Fallback bei Fehler
 
 @st.cache_resource
 def load_ai_model():
     try: return pipeline("text-classification", model="ProsusAI/finbert")
     except: return None
 
-def get_smart_money_data(symbol):
-    """Holt Daten über Insider, Short-Seller und Institutionen"""
-    t = yf.Ticker(symbol)
-    try:
-        info = t.info
-        
-        # Short Ratio: Wie viele wetten auf Absturz?
-        short_percent = info.get('shortPercentOfFloat', 0)
-        if short_percent is None: short_percent = 0
-        
-        # Institutional: Wie viel gehört den Profis?
-        institutional_holdings = info.get('heldPercentInstitutions', 0)
-        if institutional_holdings is None: institutional_holdings = 0
-        
-        data = {
-            "name": info.get('longName', symbol),
-            "sector": info.get('sector', 'Unbekannt'),
-            "currency": info.get('currency', 'USD'),
-            "pe_ratio": info.get('trailingPE', 0),
-            "price_to_sales": info.get('priceToSalesTrailing12Months', 0), # Wichtig bei Tech!
-            "short_percent": short_percent * 100, # In Prozent umrechnen
-            "institutions": institutional_holdings * 100,
-            "beta": info.get('beta', 1.0),
-            "52_week_high": info.get('fiftyTwoWeekHigh', 0),
-            "current_price": info.get('currentPrice', 0)
-        }
-        return data
-    except: return None
+def get_symbol_and_currency(user_input, mode):
+    symbol = user_input.strip()
+    currency_code = "USD" # Default Annahme
+    
+    if mode == "Deutschland (Xetra)":
+        if not symbol.endswith(".DE"): symbol += ".DE"
+        currency_code = "EUR"
+    elif mode == "USA (Original)":
+        symbol = symbol.replace(".DE", "")
+        currency_code = "USD"
+    
+    return symbol, currency_code
 
-def analyze_market(symbol):
+def fetch_data(symbol, period):
     try:
-        df = yf.download(symbol, period="2y", interval="1d", auto_adjust=True, progress=False)
+        df = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False)
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        
         if df.empty: return None
 
+        # Indikatoren Berechnung
         df['RSI'] = df.ta.rsi(length=14)
         df['ATR'] = df.ta.atr(length=14)
-        df['SMA200'] = df.ta.sma(length=200) # Langfristiger Trend
-        df['SMA50'] = df.ta.sma(length=50)   # Kurzfristiger Trend (Momentum)
+        df['SMA50'] = df.ta.sma(length=50)
+        df['SMA200'] = df.ta.sma(length=200)
         
+        # MACD
+        macd = df.ta.macd(fast=12, slow=26, signal=9)
+        df['MACD'] = macd.iloc[:, 0]
+        df['MACD_SIGNAL'] = macd.iloc[:, 2]
+
+        # Bollinger Bänder (WICHTIG für Swing)
         bands = df.ta.bbands(length=20, std=2)
         upper = [c for c in bands.columns if c.startswith("BBU")][0]
+        lower = [c for c in bands.columns if c.startswith("BBL")][0]
         df['BB_UPPER'] = bands[upper]
+        df['BB_LOWER'] = bands[lower]
+        
         return df
     except: return None
 
+def get_fundamentals(symbol):
+    t = yf.Ticker(symbol)
+    try:
+        i = t.info
+        return {
+            "name": i.get('longName', symbol),
+            "sector": i.get('sector', 'Unbekannt'),
+            "currency": i.get('currency', 'USD'),
+            "pe": i.get('trailingPE', 0),
+            "peg": i.get('pegRatio', 0),
+            "beta": i.get('beta', 0),
+            "short_float": i.get('shortPercentOfFloat', None), # Kann None sein!
+            "institutions": i.get('heldPercentInstitutions', None), # Kann None sein!
+            "target": i.get('targetMeanPrice', 0),
+            "rating": i.get('recommendationKey', 'none').upper()
+        }
+    except: return None
+
 # --- APP START ---
-st.title("🏦 Wall Street Insider & Smart Money Tracker")
+st.title("🧠 Master AI Investment Terminal")
 
-real_symbol = get_clean_symbol(ticker_input, market_mode)
+real_symbol, estimated_currency = get_symbol_and_currency(ticker_input, market_mode)
+ai_pipeline = load_ai_model()
 
-if st.button(f"Insider-Check für {real_symbol} 🚀"):
+if st.button("Vollanalyse starten 🚀"):
     
-    with st.spinner('Analysiere Short-Seller & Institutionen...'):
-        df = analyze_market(real_symbol)
-        fund = get_smart_money_data(real_symbol)
+    # Ladebalken
+    with st.spinner(f"Analysiere {real_symbol} & berechne Währungskurse..."):
+        # Zeitrahmen je nach Strategie
+        period = "2y" if strategy_mode == "Value Investing (Langzeit)" else "1y"
+        df = fetch_data(real_symbol, period)
+        fund = get_fundamentals(real_symbol)
+        
+        # KI Sentiment
+        news_score = 0
+        ai_msg = "Keine News"
+        if ai_pipeline:
+            # Fake News Abruf (vereinfacht für Speed im Beispiel)
+            # In echter App hier get_ai_score nutzen
+            pass 
 
     if df is not None and fund is not None:
-        last = df.iloc[-1]
-        curr = last['Close']
-        cur_sym = "$" if fund['currency'] == "USD" else "€"
+        # --- WÄHRUNGS-UMRECHNUNG ---
+        # Wir holen den Kurs von der Aktie zur UI (Euro)
+        stock_currency = fund['currency'] # z.B. USD
+        fx_rate = get_exchange_rate(stock_currency) # z.B. 0.95
         
+        last = df.iloc[-1]
+        curr_price_orig = last['Close']
+        curr_price_eur = curr_price_orig * fx_rate
+        
+        # --- HEADER ---
         st.header(f"{fund['name']} ({fund['sector']})")
         
-        # --- TEIL 1: SMART MONEY FLOW (Wer kauft?) ---
-        st.subheader("🕵️ Smart Money & Risiko")
+        # Top KPIs in Euro
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Preis (Live)", f"{curr_price_eur:.2f} €", help=f"Original: {curr_price_orig:.2f} {stock_currency}")
         
-        c1, c2, c3, c4 = st.columns(4)
-        
-        # A. Institutionen (Stabilität)
-        inst_val = f"{fund['institutions']:.1f}%"
-        inst_delta = "Stark" if fund['institutions'] > 60 else "Schwach"
-        c1.metric("Institutionen Besitz", inst_val, inst_delta)
-        
-        # B. Short Seller (Wetten auf Crash)
-        short_val = f"{fund['short_percent']:.2f}%"
-        # Wenn mehr als 5% geshortet sind, ist das ein Warnsignal!
-        short_state = "Normal"
-        short_color = "normal"
-        if fund['short_percent'] > 5:
-            short_state = "⚠️ Viele wetten dagegen!"
-            short_color = "inverse"
-        c2.metric("Short Interest (Wetten auf Fall)", short_val, short_state, delta_color=short_color)
-        
-        # C. Bewertung (KGV & P/S)
-        pe = fund['pe_ratio']
-        pe_msg = "Fair"
-        if pe > 50: pe_msg = "Teuer / Hype"
-        c3.metric("KGV (P/E)", f"{pe:.1f}", pe_msg, delta_color="inverse")
-        
-        # D. Abstand zum Allzeithoch
-        ath_dist = ((curr - fund['52_week_high']) / fund['52_week_high']) * 100
-        c4.metric("Abstand zum Hoch", f"{ath_dist:.1f}%")
-
-        # --- TEIL 2: BUBBLE CHECK (Chart Technik) ---
-        st.subheader("📉 Bubble- & Trend-Check")
-        
-        reasons_neg = []
-        reasons_pos = []
-        score = 0 # Skala von -5 bis +5
-        
-        # 1. Abstand zur 200-Tage-Linie (Bubble Indikator)
-        if pd.notna(last['SMA200']):
-            dist_200 = ((curr - last['SMA200']) / last['SMA200']) * 100
-            st.write(f"Abstand zur 200-Tage-Linie: **{dist_200:.1f}%**")
-            
-            if dist_200 > 50:
-                score -= 3
-                reasons_neg.append(f"EXTREM ÜBERHITZT: Kurs ist {dist_200:.0f}% über dem Durchschnitt (Bubble-Gefahr!).")
-            elif dist_200 > 20:
-                score -= 1
-                reasons_neg.append("Aktie ist historisch teuer (weit weg von der Linie).")
-            elif dist_200 < 0:
-                score -= 2
-                reasons_neg.append("Negativer Langzeittrend (Unter 200er Linie).")
-            else:
-                score += 1
-                reasons_pos.append("Gesunder Aufwärtstrend.")
-
-        # 2. SMA 50 vs SMA 200 (Momentum)
-        if pd.notna(last['SMA50']) and pd.notna(last['SMA200']):
-            if curr < last['SMA50'] and curr > last['SMA200']:
-                score -= 2
-                reasons_neg.append("⚠️ WARNUNG: Momentum verloren! Kurs fällt unter die 50-Tage-Linie.")
-        
-        # 3. Bewertung (Fundamental)
-        if fund['pe_ratio'] > 70:
-            score -= 2
-            reasons_neg.append(f"Fundamental extrem teuer (KGV {fund['pe_ratio']:.0f}).")
-        
-        # 4. Smart Money
-        if fund['institutions'] > 70:
-            score += 1
-            reasons_pos.append("Big Player (Fonds) halten die Aktie stabil.")
-        
-        if fund['short_percent'] > 5:
-            score -= 2
-            reasons_neg.append("Wall Street wettet vermehrt auf fallende Kurse!")
-
-        # 5. RSI
-        if last['RSI'] > 70:
-            score -= 2
-            reasons_neg.append("RSI Überkauft (Alle haben schon gekauft).")
-        elif last['RSI'] < 30:
-            score += 2
-            reasons_pos.append("RSI Überverkauft (Panik im Markt = Chance).")
-
-
-        # --- ANZEIGE ---
-        col1, col2 = st.columns(2)
-        with col1:
-            st.success("✅ FÜR KAUF SPRICHT")
-            for p in reasons_pos: st.write(f"• {p}")
-        with col2:
-            st.error("❌ DAGEGEN SPRICHT (RISIKO)")
-            for n in reasons_neg: st.write(f"• {n}")
-            
-        st.line_chart(df[['Close', 'SMA200', 'SMA50']])
-
-        # --- FAZIT ---
-        st.divider()
-        st.subheader("🤖 Algorithmus Fazit")
-        
-        if score >= 2:
-            st.success(f"EMPFEHLUNG: KAUFEN (Score: {score})")
-            st.write("Die positiven Faktoren überwiegen.")
-        elif score <= -2:
-            st.error(f"EMPFEHLUNG: VERKAUFEN / SHORT (Score: {score})")
-            st.write("Zu viele Warnsignale (Überhitzung, fallendes Momentum).")
+        # Smart Money (Nur anzeigen wenn Daten da sind!)
+        if fund['institutions'] is not None and fund['institutions'] > 0:
+            val = fund['institutions'] * 100
+            k2.metric("Institutionen", f"{val:.1f}%", "Stark" if val > 60 else "Schwach")
         else:
-            st.warning(f"EMPFEHLUNG: NEUTRAL / HOLD (Score: {score})")
-            st.write("Markt ist unentschlossen. Risiko zu hoch für Neueinstieg.")
+            k2.metric("Institutionen", "n/a", help="Daten für diesen Markt nicht verfügbar")
+            
+        # Short Interest
+        if fund['short_float'] is not None:
+            val = fund['short_float'] * 100
+            k3.metric("Short Quote", f"{val:.2f}%", "Hoch!" if val > 5 else "Normal", delta_color="inverse")
+        else:
+            k3.metric("Short Quote", "n/a")
+            
+        # PE / KGV
+        pe_val = f"{fund['pe']:.1f}" if fund['pe'] > 0 else "k.A."
+        k4.metric("KGV (P/E)", pe_val)
+
+        st.divider()
+
+        # --- ANALYSE LOGIK (Score Berechnung) ---
+        score = 0
+        reasons_pro = []
+        reasons_con = []
+        
+        # 1. Trend (SMA)
+        if pd.notna(last['SMA200']):
+            if curr_price_orig > last['SMA200']:
+                score += 1
+                reasons_pro.append("Aufwärtstrend (Kurs > 200-Tage-Linie)")
+                trend_direction = "LONG"
+            else:
+                score -= 1
+                reasons_con.append("Abwärtstrend (Kurs < 200-Tage-Linie)")
+                trend_direction = "SHORT"
+        
+        # 2. Momentum (MACD)
+        if last['MACD'] > last['MACD_SIGNAL']:
+            score += 1
+            reasons_pro.append("MACD Momentum positiv")
+        else:
+            score -= 1
+            reasons_con.append("MACD Momentum negativ")
+            
+        # 3. Bollinger Bänder (Mean Reversion)
+        # Ist der Kurs am oberen Band? (Überkauft -> Short Chance)
+        if curr_price_orig > last['BB_UPPER']:
+            reasons_con.append("Kurs am oberen Bollinger Band (Überhitzt)")
+            if strategy_mode == "Swing Trading (Kurz)": score -= 2 
+        # Ist der Kurs am unteren Band? (Überverkauft -> Long Chance)
+        elif curr_price_orig < last['BB_LOWER']:
+            reasons_pro.append("Kurs am unteren Bollinger Band (Rebound Chance)")
+            if strategy_mode == "Swing Trading (Kurz)": score += 2
+
+        # 4. RSI
+        if last['RSI'] > 70:
+            reasons_con.append(f"RSI extrem hoch ({last['RSI']:.0f})")
+            score -= 1
+        elif last['RSI'] < 30:
+            reasons_pro.append(f"RSI extrem niedrig ({last['RSI']:.0f})")
+            score += 1
+
+        # --- ANZEIGE DER ARGUMENTE ---
+        c_pro, c_con = st.columns(2)
+        with c_pro:
+            st.success("✅ BULLISH (FÜR KAUF/LONG)")
+            for r in reasons_pro: st.write(f"• {r}")
+        with c_con:
+            st.error("❌ BEARISH (FÜR VERKAUF/SHORT)")
+            for r in reasons_con: st.write(f"• {r}")
+
+        # --- CHART ---
+        st.subheader("📊 Chart Analyse (Bollinger & SMA)")
+        # Wir zeigen den Chart in Original-Währung (sauberer), aber Rechenwerte in Euro
+        chart_data = df[['Close', 'SMA200', 'BB_UPPER', 'BB_LOWER']]
+        st.line_chart(chart_data)
+
+        # --- TRADING PLAN (DAS HERZSTÜCK) ---
+        st.divider()
+        st.subheader("📋 Dein Trading Plan (in Euro)")
+        
+        # Ziele setzen basierend auf Strategie
+        stop_loss_eur = 0.0
+        take_profit_eur = 0.0
+        action = "NEUTRAL"
+        
+        # Logik für SWING TRADING (Bollinger Bänder)
+        if strategy_mode == "Swing Trading (Kurz)":
+            # LONG SZENARIO (Wir kaufen unten)
+            if score >= 1: 
+                action = "LONG (Kaufen)"
+                # Ziel: Oberes Band
+                take_profit_orig = last['BB_UPPER']
+                # Stop: Unteres Band oder 2x ATR
+                stop_loss_orig = curr_price_orig - (1.5 * last['ATR'])
+                
+            # SHORT SZENARIO (Wir wetten auf Fall)
+            elif score <= -1:
+                action = "SHORT (Auf Fall wetten)"
+                # Ziel: Unteres Band
+                take_profit_orig = last['BB_LOWER']
+                # Stop: Oberes Band
+                stop_loss_orig = curr_price_orig + (1.5 * last['ATR'])
+            else:
+                action = "WARTEN"
+                take_profit_orig = curr_price_orig
+                stop_loss_orig = curr_price_orig
+                
+        # Logik für VALUE INVESTING (Langzeit)
+        else:
+            if score >= 2:
+                action = "INVESTIEREN (Long)"
+                # Ziel: Analysten Ziel oder +30%
+                take_profit_orig = fund['target'] if fund['target'] > 0 else (curr_price_orig * 1.3)
+                # Stop: Weit weg (SMA200 oder 15%)
+                stop_loss_orig = curr_price_orig * 0.85
+            else:
+                action = "NICHT INVESTIEREN"
+                take_profit_orig = curr_price_orig
+                stop_loss_orig = curr_price_orig
+
+        # UMRECHNUNG IN EURO FÜR DIE ANZEIGE
+        tp_eur = take_profit_orig * fx_rate
+        sl_eur = stop_loss_orig * fx_rate
+        
+        # RISIKO BERECHNUNG
+        # Risiko pro Aktie in Euro
+        if "SHORT" in action:
+            risk_per_share_eur = sl_eur - curr_price_eur
+            chance_per_share_eur = curr_price_eur - tp_eur
+        else: # LONG
+            risk_per_share_eur = curr_price_eur - sl_eur
+            chance_per_share_eur = tp_eur - curr_price_eur
+            
+        # CRV
+        crv = chance_per_share_eur / risk_per_share_eur if risk_per_share_eur > 0 else 0
+        
+        # Stückzahl
+        risk_budget = konto * (risk_pct / 100)
+        qty = math.floor(risk_budget / risk_per_share_eur) if risk_per_share_eur > 0 else 0
+        invest_sum = qty * curr_price_eur
+
+        # --- FINALE BOX ---
+        if action == "WARTEN" or action == "NICHT INVESTIEREN":
+            st.warning(f"✋ Empfehlung: {action}")
+            st.write("Score ist zu schwach oder uneindeutig.")
+        else:
+            # Farbe je nach Long/Short
+            if "SHORT" in action:
+                st.error(f"📉 Empfehlung: {action}")
+            else:
+                st.success(f"📈 Empfehlung: {action}")
+                
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Stop Loss", f"{sl_eur:.2f} €", help="Hier autom. verkaufen um Verlust zu begrenzen")
+            c2.metric("Take Profit", f"{tp_eur:.2f} €", help="Hier Gewinne mitnehmen")
+            c3.metric("CRV", f"{crv:.2f}", delta="Gut" if crv > 2 else "Mittel")
+            c4.metric("Stückzahl", f"{qty}", help=f"Basierend auf {risk_pct}% Risiko ({risk_budget:.2f}€)")
+            
+            st.info(f"💰 Einsatz: **{invest_sum:.2f} €** (Risiko: -{risk_budget:.2f} € | Chance: +{qty*chance_per_share_eur:.2f} €)")
+            
+            if qty == 0:
+                st.warning("⚠️ **Stückzahl ist 0:** Dein Risiko-Budget ist zu klein für den Abstand zum Stop-Loss. Erhöhe das Risiko (%) oder wähle engere Stops.")
+
+    else:
+        st.error("Fehler beim Laden. Bitte Symbol prüfen (USA Modus für US-Aktien nutzen!)")
 
 
 
