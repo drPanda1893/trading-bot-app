@@ -168,89 +168,104 @@ if st.button("Vollanalyse starten 🚀"):
         reasons_pro = []
         reasons_con = []
         
-        # 1. Trend (SMA)
+        # 1. Trend (SMA 200) - Der "Filter"
+        # Investing: Streng / Swing: Lockerer
         if pd.notna(last['SMA200']):
             if curr_price_orig > last['SMA200']:
                 score += 1
-                reasons_pro.append("Aufwärtstrend (Kurs > 200-Tage-Linie)")
-                trend_direction = "LONG"
+                reasons_pro.append("Langfristiger Aufwärtstrend")
             else:
-                score -= 1
-                reasons_con.append("Abwärtstrend (Kurs < 200-Tage-Linie)")
-                trend_direction = "SHORT"
+                # WICHTIG: Im Swing Trading bestrafen wir Downtrend weniger stark, 
+                # wenn wir auf Rebound spekulieren
+                if strategy_mode == "Value Investing (Langzeit)":
+                    score -= 2 # Strenges Verbot für Langzeit
+                    reasons_con.append("Abwärtstrend (No-Go für Investing)")
+                else:
+                    score -= 0.5 # Nur leichte Warnung für Swing
+                    reasons_con.append("Gegen den Haupttrend (Riskanter)")
         
         # 2. Momentum (MACD)
         if last['MACD'] > last['MACD_SIGNAL']:
             score += 1
-            reasons_pro.append("MACD Momentum positiv")
+            reasons_pro.append("MACD Momentum dreht hoch")
         else:
             score -= 1
-            reasons_con.append("MACD Momentum negativ")
+            reasons_con.append("MACD Momentum noch negativ")
             
-        # 3. Bollinger Bänder (Mean Reversion)
-        # Ist der Kurs am oberen Band? (Überkauft -> Short Chance)
+        # 3. Bollinger Bänder (Der Rebound-Faktor)
+        # Ist der Kurs am oberen Band?
         if curr_price_orig > last['BB_UPPER']:
-            reasons_con.append("Kurs am oberen Bollinger Band (Überhitzt)")
+            reasons_con.append("Kurs am oberen Band (Rückschlag-Gefahr)")
             if strategy_mode == "Swing Trading (Kurz)": score -= 2 
-        # Ist der Kurs am unteren Band? (Überverkauft -> Long Chance)
-        elif curr_price_orig < last['BB_LOWER']:
-            reasons_pro.append("Kurs am unteren Bollinger Band (Rebound Chance)")
-            if strategy_mode == "Swing Trading (Kurz)": score += 2
+            
+        # Ist der Kurs am unteren Band? -> HIER IST DER FIX
+        elif curr_price_orig <= last['BB_LOWER'] * 1.01: # 1% Toleranz
+            reasons_pro.append("Kurs am unteren Band (Rebound Chance!)")
+            
+            if strategy_mode == "Swing Trading (Kurz)": 
+                score += 3 # MASSIVE PUNKTE für Swing Trader
+            else:
+                score += 0.5 # Für Investoren nur ein kleiner Bonus ("billig")
 
-        # 4. RSI
+        # 4. RSI (Der Panik-Messer)
         if last['RSI'] > 70:
-            reasons_con.append(f"RSI extrem hoch ({last['RSI']:.0f})")
+            reasons_con.append(f"RSI überhitzt ({last['RSI']:.0f})")
             score -= 1
         elif last['RSI'] < 30:
-            reasons_pro.append(f"RSI extrem niedrig ({last['RSI']:.0f})")
-            score += 1
+            reasons_pro.append(f"RSI Panik-Zone ({last['RSI']:.0f}) -> Kauf-Signal")
+            score += 2 # Extra Punkte für Panik
 
         # --- ANZEIGE DER ARGUMENTE ---
         c_pro, c_con = st.columns(2)
         with c_pro:
-            st.success("✅ BULLISH (FÜR KAUF/LONG)")
+            st.success("✅ BULLISH (FÜR KAUF)")
             for r in reasons_pro: st.write(f"• {r}")
         with c_con:
-            st.error("❌ BEARISH (FÜR VERKAUF/SHORT)")
+            st.error("❌ BEARISH (FÜR VERKAUF)")
             for r in reasons_con: st.write(f"• {r}")
 
         # --- CHART ---
-        st.subheader("📊 Chart Analyse (Bollinger & SMA)")
-        # Wir zeigen den Chart in Original-Währung (sauberer), aber Rechenwerte in Euro
+        st.subheader("📊 Chart Analyse")
         chart_data = df[['Close', 'SMA200', 'BB_UPPER', 'BB_LOWER']]
         st.line_chart(chart_data)
 
-       # --- TRADING PLAN (DAS HERZSTÜCK) ---
+        # --- TRADING PLAN ---
         st.divider()
-        st.subheader("📋 Dein Trading Plan (in Euro)")
+        st.subheader("📋 Trading Plan (in Euro)")
         
-        # Ziele setzen basierend auf Strategie
+        # Default Werte
         stop_loss_eur = 0.0
         take_profit_eur = 0.0
         action = "NEUTRAL"
         
-        # Logik für SWING TRADING (Bollinger Bänder)
+        # --- LOGIK SWING TRADING ---
         if strategy_mode == "Swing Trading (Kurz)":
-            # LONG SZENARIO (Wir kaufen unten)
-            if score >= 1: 
-                action = "LONG (Kaufen)"
-                take_profit_orig = last['BB_UPPER']
-                stop_loss_orig = curr_price_orig - (1.5 * last['ATR'])
+            
+            # REBOUND SETUP (Wir kaufen im Keller)
+            # Wenn Score > 1 ODER wir am unteren Band sind
+            if score >= 1.5: 
+                action = "LONG (Rebound Trade)"
+                # Ziel: Die Mitte (SMA20) oder das obere Band
+                # Konservatives Ziel: SMA50 (weil wir gegen den Trend handeln)
+                take_profit_orig = last['SMA50'] if pd.notna(last['SMA50']) else last['BB_UPPER']
                 
-            # SHORT SZENARIO (Wir wetten auf Fall)
-            elif score <= -1:
-                action = "SHORT (Auf Fall wetten)"
+                # Stop: Knapp unter dem aktuellen Tief (Bollinger Lower)
+                stop_loss_orig = last['BB_LOWER'] * 0.98 # 2% Luft lassen
+                
+            # SHORT SETUP
+            elif score <= -1.5:
+                action = "SHORT (Trend-Folge)"
                 take_profit_orig = last['BB_LOWER']
-                stop_loss_orig = curr_price_orig + (1.5 * last['ATR'])
+                stop_loss_orig = last['BB_UPPER'] * 1.02
             else:
                 action = "WARTEN"
                 take_profit_orig = curr_price_orig
                 stop_loss_orig = curr_price_orig
                 
-        # Logik für VALUE INVESTING (Langzeit)
+        # --- LOGIK INVESTING ---
         else:
-            if score >= 2:
-                action = "INVESTIEREN (Long)"
+            if score >= 3: # Höhere Hürde für Investing
+                action = "INVESTIEREN"
                 take_profit_orig = fund['target'] if fund['target'] > 0 else (curr_price_orig * 1.3)
                 stop_loss_orig = curr_price_orig * 0.85
             else:
@@ -258,66 +273,45 @@ if st.button("Vollanalyse starten 🚀"):
                 take_profit_orig = curr_price_orig
                 stop_loss_orig = curr_price_orig
 
-        # UMRECHNUNG IN EURO
+        # UMRECHNUNG & ANZEIGE (Rest bleibt gleich wie vorher)
+        # ... (Ab hier den Code vom vorherigen Mal nutzen, das ist nur die Logik-Anpassung) ...
+        
         tp_eur = take_profit_orig * fx_rate
         sl_eur = stop_loss_orig * fx_rate
         
-        # RISIKO BERECHNUNG & CRV
         if "SHORT" in action:
-            # Bei Short: Risiko entsteht wenn Preis STEIGT (SL > Einstieg)
             risk_per_share_eur = sl_eur - curr_price_eur
             chance_per_share_eur = curr_price_eur - tp_eur
-        else: # LONG
-            # Bei Long: Risiko entsteht wenn Preis FÄLLT (SL < Einstieg)
+        else: 
             risk_per_share_eur = curr_price_eur - sl_eur
             chance_per_share_eur = tp_eur - curr_price_eur
             
-        # CRV Berechnung (Sicherheit vor Division durch 0)
-        if risk_per_share_eur > 0:
-            crv = chance_per_share_eur / risk_per_share_eur
-        else:
-            crv = 0
-        
-        # Stückzahl
+        crv = chance_per_share_eur / risk_per_share_eur if risk_per_share_eur > 0 else 0
         risk_budget = konto * (risk_pct / 100)
         qty = math.floor(risk_budget / risk_per_share_eur) if risk_per_share_eur > 0 else 0
         invest_sum = qty * curr_price_eur
+        
+        # CRV Filter (etwas lockerer für Rebounds)
+        is_profitable = crv > 1.0 
 
-        # --- FINALE BOX MIT CRV-FILTER ---
-        
-        # Wir filtern Trades raus, die sich mathematisch nicht lohnen (CRV < 1.0)
-        is_profitable_trade = crv > 1.2  # Mindestanforderung: 20% mehr Gewinn als Risiko
-        
         if action == "WARTEN" or action == "NICHT INVESTIEREN":
-            st.warning(f"✋ Empfehlung: {action}")
-            st.write("Kein klares Signal vom Algorithmus.")
-            
-        elif not is_profitable_trade:
-            # NEU: Warnung statt Empfehlung, wenn CRV schlecht ist
-            st.warning(f"✋ Signal vorhanden ({action}), aber LOHNT NICHT.")
-            
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Risiko", f"-{risk_per_share_eur:.2f} €/Aktie")
-            c2.metric("Chance", f"+{chance_per_share_eur:.2f} €/Aktie")
-            c3.metric("CRV", f"{crv:.2f}", delta="Schlecht", delta_color="inverse")
-            
-            st.error("Der Kurs ist bereits zu nah am Ziel. Das Risiko ist größer als der mögliche Gewinn!")
-            
+            st.warning(f"✋ Empfehlung: {action} (Score: {score})")
+        elif not is_profitable:
+            st.warning(f"✋ Signal {action}, aber CRV zu schlecht ({crv:.2f}).")
+            st.caption("Das Ziel ist zu nah am Einstieg.")
         else:
-            # GUTER TRADE
             if "SHORT" in action:
                 st.error(f"📉 Empfehlung: {action}")
-                st.caption("Bei SHORT: Stop Loss liegt ÜBER dem aktuellen Preis.")
             else:
                 st.success(f"📈 Empfehlung: {action}")
                 
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Stop Loss", f"{sl_eur:.2f} €", help="Verkaufen wenn erreicht")
-            c2.metric("Take Profit", f"{tp_eur:.2f} €", help="Ziel erreicht")
-            c3.metric("CRV", f"{crv:.2f}", delta="Gut" if crv > 2 else "Ok")
-            c4.metric("Stückzahl", f"{qty}", help=f"Budget: {risk_budget:.2f}€")
-            
-            st.info(f"💰 Einsatz: **{invest_sum:.2f} €** (Max. Verlust: -{risk_budget:.2f} € | Ziel-Gewinn: +{qty*chance_per_share_eur:.2f} €)")
+            c1.metric("Stop Loss", f"{sl_eur:.2f} €")
+            c2.metric("Take Profit", f"{tp_eur:.2f} €")
+            c3.metric("CRV", f"{crv:.2f}")
+            c4.metric("Stückzahl", f"{qty}")
+            st.info(f"💰 Einsatz: **{invest_sum:.2f} €**")
+
 
 
 
