@@ -68,25 +68,48 @@ def get_ai_score(symbol, ai_pipeline):
     # Basis Symbol für News (ohne .DE)
     base = symbol.replace(".DE", "")
     ticker = yf.Ticker(base)
-    news = ticker.news
-
+    
+    try:
+        news = ticker.news
+    except Exception:
+        return "Neutral", 0, []
+    
     if not news:
         return "Neutral", 0, []
+        
+    headlines = []
+    for n in news[:3]:
+        # --- DER FIX ---
+        # Wir nutzen .get('title'), das stürzt nicht ab, wenn der Key fehlt.
+        # Fallback: Falls es keinen Titel gibt, nehmen wir einen leeren String.
+        titel = n.get('title') 
+        
+        # Manchmal steckt der Titel auch im Feld 'content'
+        if not titel:
+            titel = n.get('content', "")
+            
+        if titel: # Nur hinzufügen, wenn wir wirklich Text gefunden haben
+            headlines.append(titel)
+            
+    if not headlines:
+        return "Neutral", 0, []
 
-    headlines = [n['title'] for n in news[:3]]
-    results = ai_pipeline(headlines)
-
+    # KI Analyse
+    try:
+        results = ai_pipeline(headlines)
+    except Exception as e:
+        # Falls die KI mit dem Text nicht klarkommt
+        return "Neutral", 0, []
+    
     score = 0
     for res in results:
-        if res['label'] == 'positive':
-            score += 1
-        elif res['label'] == 'negative':
-            score -= 1
-
+        if res['label'] == 'positive': score += 1
+        elif res['label'] == 'negative': score -= 1
+        
     stimmung = "Neutral"
     if score > 0: stimmung = "Positiv"
     if score < 0: stimmung = "Negativ"
-
+    
     return stimmung, score, headlines
 
 
@@ -167,4 +190,5 @@ if st.button("Analyse Starten 🚀"):
         # News anzeigen
         with st.expander("Gelesene Schlagzeilen ansehen"):
             for h in headlines:
+
                 st.write(f"- {h}")
