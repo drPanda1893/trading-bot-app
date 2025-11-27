@@ -221,14 +221,15 @@ if st.button("Vollanalyse starten 🚀"):
         fig.update_layout(height=500, xaxis_rangeslider_visible=False, template="plotly_dark")
         st.plotly_chart(fig, use_container_width=True)
 
+        # --- TRADING PLAN & MATHE ---
         st.divider()
-        st.subheader("📋 Trading Plan (in Euro)")
+        st.subheader("📋 Trading Plan & Kennzahlen")
         
         # --- DYNAMISCHE SCHWELLENWERTE ---
         min_score_long = 2.0
         min_score_short = -2.0
         min_crv = 1.2
-        target_strategy = "Konservativ (SMA50)" # Info für User
+        target_strategy = "Konservativ (SMA50)"
         
         if aggro_mode == "Sicherheits-Fanatiker 🛡️":
             min_score_long = 3.0
@@ -237,34 +238,29 @@ if st.button("Vollanalyse starten 🚀"):
         elif aggro_mode == "Risiko-Freudig (Degen) 🚀":
             min_score_long = 0.5 
             min_score_short = -0.5
-            min_crv = 0.6 # Wir akzeptieren auch schlechtere CRVs
-            target_strategy = "Maximum (Bollinger Band)" # Gieriges Ziel!
+            min_crv = 0.6 
+            target_strategy = "Maximum (Bollinger Band)"
         
         action = "WARTEN"
         tp_orig = last['Close']
         sl_orig = last['Close']
         
+        # --- ZIEL & STOP BESTIMMUNG ---
         if strategy_mode == "Swing Trading (Kurz)":
             if score >= min_score_long:
                 action = "LONG (Rebound)"
-                
-                # ZIEL-LOGIK: Im Degen-Modus zielen wir immer auf das obere Band (Gierig)
                 if "Risiko-Freudig" in aggro_mode:
                     tp_orig = last['BB_UPPER']
                 else:
-                    # Sonst vorsichtig zur Mitte (SMA50)
                     tp_orig = last['SMA50'] if pd.notna(last['SMA50']) else last['BB_UPPER']
-                
                 sl_orig = last['BB_LOWER'] * 0.98
                 
             elif score <= min_score_short:
                 action = "SHORT"
-                
                 if "Risiko-Freudig" in aggro_mode:
-                    tp_orig = last['BB_LOWER'] # Ziel: Ganz nach unten
+                    tp_orig = last['BB_LOWER']
                 else:
                     tp_orig = last['SMA50'] if pd.notna(last['SMA50']) else last['BB_LOWER']
-                    
                 sl_orig = last['BB_UPPER'] * 1.02
         else:
             # Investing
@@ -273,39 +269,96 @@ if st.button("Vollanalyse starten 🚀"):
                 tp_orig = fund['target'] if fund['target'] > 0 else last['Close']*1.3
                 sl_orig = last['Close'] * 0.85
 
+        # Umrechnen in Euro
         tp_eur = tp_orig * fx_rate
         sl_eur = sl_orig * fx_rate
         curr_eur = last['Close'] * fx_rate
         
+        # --- RISIKO & CHANCE BERECHNUNG ---
         if "SHORT" in action:
-            risk = sl_eur - curr_eur
-            chance = curr_eur - tp_eur
-        else:
-            risk = curr_eur - sl_eur
-            chance = tp_eur - curr_eur
+            risk_per_share = sl_eur - curr_eur
+            reward_per_share = curr_eur - tp_eur
+        else: # LONG
+            risk_per_share = curr_eur - sl_eur
+            reward_per_share = tp_eur - curr_eur
             
-        crv = chance / risk if risk > 0 else 0
-        budget = konto * (risk_pct / 100)
-        qty = math.floor(budget / risk) if risk > 0 else 0
+        # Absolute Werte sicherstellen
+        risk_per_share = max(0, risk_per_share)
+        reward_per_share = max(0, reward_per_share)
+
+        # CRV
+        crv = reward_per_share / risk_per_share if risk_per_share > 0 else 0
         
-        # Anzeige Logik
+        # Stückzahl & Budget
+        budget = konto * (risk_pct / 100)
+        qty = math.floor(budget / risk_per_share) if risk_per_share > 0 else 0
+        invest_sum = qty * curr_eur
+        
+        # Totale Summen
+        total_risk = qty * risk_per_share
+        total_reward = qty * reward_per_share
+        
+        # Prozentuales Potenzial
+        upside_pct = (reward_per_share / curr_eur) * 100
+        downside_pct = (risk_per_share / curr_eur) * 100
+
+        # --- MÜ (ERWARTUNGSWERT) BERECHNUNG ---
+        # Wir schätzen die Wahrscheinlichkeit anhand des Scores
+        # Score 0 = 50% (Zufall), Score 5 = 75% Wahrscheinlichkeit
+        # Wir nutzen den Absolutbetrag von Score, damit Short (negativ) auch zählt
+        base_prob = 0.50
+        prob_boost = abs(score) * 0.05 # 5% mehr Sicherheit pro Punkt
+        win_prob = min(0.85, base_prob + prob_boost) # Max 85% Wahrscheinlichkeit
+        loss_prob = 1.0 - win_prob
+        
+        # Mü Formel: (Gewinn * Chance) - (Verlust * Risiko)
+        mu_value = (total_reward * win_prob) - (total_risk * loss_prob)
+        
+        # --- ANZEIGE ---
         if action == "WARTEN":
             st.warning(f"✋ Keine klare Chance (Score {score} zu niedrig für '{aggro_mode}')")
         elif crv < min_crv:
-            st.warning(f"✋ Signal {action} da, aber CRV ({crv:.2f}) ist selbst für Degen zu schlecht.")
-            st.caption(f"Ziel-Strategie: {target_strategy}. Der Kurs ist schon zu nah am Ziel.")
+            st.warning(f"✋ Signal {action}, aber CRV ({crv:.2f}) lohnt nicht.")
+            st.caption(f"Risiko: {downside_pct:.2f}% | Chance: {upside_pct:.2f}%")
         else:
             color = "red" if "SHORT" in action else "green"
             st.markdown(f":{color}[## Empfehlung: {action}]")
             st.caption(f"Ziel-Strategie: {target_strategy}")
             
+            # 1. Die Hard Facts
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Stop Loss", f"{sl_eur:.2f} €")
-            c2.metric("Take Profit", f"{tp_eur:.2f} €")
-            c3.metric("CRV", f"{crv:.2f}")
+            c1.metric("Stop Loss", f"{sl_eur:.2f} €", f"-{downside_pct:.2f}%")
+            c2.metric("Take Profit", f"{tp_eur:.2f} €", f"+{upside_pct:.2f}%")
+            c3.metric("CRV (R-Multiple)", f"{crv:.2f}")
             c4.metric("Stückzahl", f"{qty}")
             
-            st.info(f"💰 Invest: {qty*curr_eur:.2f} € (Risiko: {budget:.2f} €)")
+            st.divider()
+            
+            # 2. Die Simulation (Was passiert wenn...?)
+            col_loss, col_win = st.columns(2)
+            
+            with col_loss:
+                st.error("📉 WENN ES SCHIEF GEHT")
+                st.write(f"Verlust: **-{total_risk:.2f} €**")
+                st.write(f"Wahrscheinlichkeit: {loss_prob*100:.0f}%")
+                
+            with col_win:
+                st.success("📈 WENN ES KLAPPT")
+                st.write(f"Gewinn: **+{total_reward:.2f} €**")
+                st.write(f"Wahrscheinlichkeit: {win_prob*100:.0f}% (basierend auf Score)")
+            
+            # 3. Das Mü (Das Fazit für Mathe-Freaks)
+            st.info(f"🧮 **Erwartungswert (Mü): {mu_value:.2f} €**")
+            if mu_value > 0:
+                st.caption("Mathematisch positiver Trade. Das Casino ist auf deiner Seite.")
+            else:
+                st.caption("Achtung: Mathematisch negativer Erwartungswert (Risiko zu hoch für die Chance).")
+            
+            st.write(f"Einsatzkapital: **{invest_sum:.2f} €**")
+
+    else:
+        st.error("Fehler beim Laden.")
+
 
 
 
