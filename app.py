@@ -220,7 +220,7 @@ if st.button("Vollanalyse starten 🚀"):
         chart_data = df[['Close', 'SMA200', 'BB_UPPER', 'BB_LOWER']]
         st.line_chart(chart_data)
 
-        # --- TRADING PLAN (DAS HERZSTÜCK) ---
+       # --- TRADING PLAN (DAS HERZSTÜCK) ---
         st.divider()
         st.subheader("📋 Dein Trading Plan (in Euro)")
         
@@ -234,17 +234,13 @@ if st.button("Vollanalyse starten 🚀"):
             # LONG SZENARIO (Wir kaufen unten)
             if score >= 1: 
                 action = "LONG (Kaufen)"
-                # Ziel: Oberes Band
                 take_profit_orig = last['BB_UPPER']
-                # Stop: Unteres Band oder 2x ATR
                 stop_loss_orig = curr_price_orig - (1.5 * last['ATR'])
                 
             # SHORT SZENARIO (Wir wetten auf Fall)
             elif score <= -1:
                 action = "SHORT (Auf Fall wetten)"
-                # Ziel: Unteres Band
                 take_profit_orig = last['BB_LOWER']
-                # Stop: Oberes Band
                 stop_loss_orig = curr_price_orig + (1.5 * last['ATR'])
             else:
                 action = "WARTEN"
@@ -255,60 +251,74 @@ if st.button("Vollanalyse starten 🚀"):
         else:
             if score >= 2:
                 action = "INVESTIEREN (Long)"
-                # Ziel: Analysten Ziel oder +30%
                 take_profit_orig = fund['target'] if fund['target'] > 0 else (curr_price_orig * 1.3)
-                # Stop: Weit weg (SMA200 oder 15%)
                 stop_loss_orig = curr_price_orig * 0.85
             else:
                 action = "NICHT INVESTIEREN"
                 take_profit_orig = curr_price_orig
                 stop_loss_orig = curr_price_orig
 
-        # UMRECHNUNG IN EURO FÜR DIE ANZEIGE
+        # UMRECHNUNG IN EURO
         tp_eur = take_profit_orig * fx_rate
         sl_eur = stop_loss_orig * fx_rate
         
-        # RISIKO BERECHNUNG
-        # Risiko pro Aktie in Euro
+        # RISIKO BERECHNUNG & CRV
         if "SHORT" in action:
+            # Bei Short: Risiko entsteht wenn Preis STEIGT (SL > Einstieg)
             risk_per_share_eur = sl_eur - curr_price_eur
             chance_per_share_eur = curr_price_eur - tp_eur
         else: # LONG
+            # Bei Long: Risiko entsteht wenn Preis FÄLLT (SL < Einstieg)
             risk_per_share_eur = curr_price_eur - sl_eur
             chance_per_share_eur = tp_eur - curr_price_eur
             
-        # CRV
-        crv = chance_per_share_eur / risk_per_share_eur if risk_per_share_eur > 0 else 0
+        # CRV Berechnung (Sicherheit vor Division durch 0)
+        if risk_per_share_eur > 0:
+            crv = chance_per_share_eur / risk_per_share_eur
+        else:
+            crv = 0
         
         # Stückzahl
         risk_budget = konto * (risk_pct / 100)
         qty = math.floor(risk_budget / risk_per_share_eur) if risk_per_share_eur > 0 else 0
         invest_sum = qty * curr_price_eur
 
-        # --- FINALE BOX ---
+        # --- FINALE BOX MIT CRV-FILTER ---
+        
+        # Wir filtern Trades raus, die sich mathematisch nicht lohnen (CRV < 1.0)
+        is_profitable_trade = crv > 1.2  # Mindestanforderung: 20% mehr Gewinn als Risiko
+        
         if action == "WARTEN" or action == "NICHT INVESTIEREN":
             st.warning(f"✋ Empfehlung: {action}")
-            st.write("Score ist zu schwach oder uneindeutig.")
+            st.write("Kein klares Signal vom Algorithmus.")
+            
+        elif not is_profitable_trade:
+            # NEU: Warnung statt Empfehlung, wenn CRV schlecht ist
+            st.warning(f"✋ Signal vorhanden ({action}), aber LOHNT NICHT.")
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Risiko", f"-{risk_per_share_eur:.2f} €/Aktie")
+            c2.metric("Chance", f"+{chance_per_share_eur:.2f} €/Aktie")
+            c3.metric("CRV", f"{crv:.2f}", delta="Schlecht", delta_color="inverse")
+            
+            st.error("Der Kurs ist bereits zu nah am Ziel. Das Risiko ist größer als der mögliche Gewinn!")
+            
         else:
-            # Farbe je nach Long/Short
+            # GUTER TRADE
             if "SHORT" in action:
                 st.error(f"📉 Empfehlung: {action}")
+                st.caption("Bei SHORT: Stop Loss liegt ÜBER dem aktuellen Preis.")
             else:
                 st.success(f"📈 Empfehlung: {action}")
                 
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Stop Loss", f"{sl_eur:.2f} €", help="Hier autom. verkaufen um Verlust zu begrenzen")
-            c2.metric("Take Profit", f"{tp_eur:.2f} €", help="Hier Gewinne mitnehmen")
-            c3.metric("CRV", f"{crv:.2f}", delta="Gut" if crv > 2 else "Mittel")
-            c4.metric("Stückzahl", f"{qty}", help=f"Basierend auf {risk_pct}% Risiko ({risk_budget:.2f}€)")
+            c1.metric("Stop Loss", f"{sl_eur:.2f} €", help="Verkaufen wenn erreicht")
+            c2.metric("Take Profit", f"{tp_eur:.2f} €", help="Ziel erreicht")
+            c3.metric("CRV", f"{crv:.2f}", delta="Gut" if crv > 2 else "Ok")
+            c4.metric("Stückzahl", f"{qty}", help=f"Budget: {risk_budget:.2f}€")
             
-            st.info(f"💰 Einsatz: **{invest_sum:.2f} €** (Risiko: -{risk_budget:.2f} € | Chance: +{qty*chance_per_share_eur:.2f} €)")
-            
-            if qty == 0:
-                st.warning("⚠️ **Stückzahl ist 0:** Dein Risiko-Budget ist zu klein für den Abstand zum Stop-Loss. Erhöhe das Risiko (%) oder wähle engere Stops.")
+            st.info(f"💰 Einsatz: **{invest_sum:.2f} €** (Max. Verlust: -{risk_budget:.2f} € | Ziel-Gewinn: +{qty*chance_per_share_eur:.2f} €)")
 
-    else:
-        st.error("Fehler beim Laden. Bitte Symbol prüfen (USA Modus für US-Aktien nutzen!)")
 
 
 
