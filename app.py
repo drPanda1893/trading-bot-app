@@ -12,10 +12,21 @@ st.set_page_config(page_title="Master AI Trader", page_icon="🧠", layout="wide
 # --- SIDEBAR ---
 st.sidebar.title("🎛️ Steuerzentrale")
 market_mode = st.sidebar.selectbox("Markt / Börse", ["Deutschland (Xetra)", "USA (Original)", "Weltweit"])
-ticker_input = st.sidebar.text_input("Symbol", value="LIN").upper()
+ticker_input = st.sidebar.text_input("Symbol", value="PYPL").upper()
 strategy_mode = st.sidebar.selectbox("Strategie", ["Swing Trading (Kurz)", "Value Investing (Langzeit)"])
+
+st.sidebar.divider()
+st.sidebar.subheader("🧠 Bot-Persönlichkeit")
+# NEU: Der Aggressivitäts-Regler
+aggro_mode = st.sidebar.select_slider(
+    "Wie risikofreudig soll der Bot entscheiden?",
+    options=["Sicherheits-Fanatiker 🛡️", "Ausgewogen ⚖️", "Risiko-Freudig (Degen) 🚀"],
+    value="Ausgewogen ⚖️"
+)
+
+st.sidebar.divider()
 konto = st.sidebar.number_input("Dein Kontostand (€)", value=10000.0, step=500.0)
-risk_pct = st.sidebar.slider("Risiko pro Trade (%)", 0.5, 5.0, 2.0)
+risk_pct = st.sidebar.slider("Risiko pro Trade (%)", 0.5, 10.0, 2.0)
 
 # --- HELPER FUNKTIONEN ---
 
@@ -33,19 +44,15 @@ def load_ai_model():
     try: return pipeline("text-classification", model="ProsusAI/finbert")
     except: return None
 
-# --- HIER WAR DER FEHLER (JETZT KORRIGIERT) ---
 def get_symbol_and_currency(user_input, mode):
     symbol = user_input.strip()
-    currency = "USD" # Standard-Annahme
-    
+    currency = "USD" 
     if mode == "Deutschland (Xetra)":
         if not symbol.endswith(".DE"): symbol += ".DE"
         currency = "EUR"
     elif mode == "USA (Original)":
         symbol = symbol.replace(".DE", "")
         currency = "USD"
-        
-    # Wir geben jetzt BEIDES zurück: Symbol UND Währung
     return symbol, currency 
 
 def fetch_data(symbol, period):
@@ -78,7 +85,6 @@ def get_fundamentals(symbol):
     try:
         i = t.info
         sector = i.get('sector', i.get('industry', 'Unbekannt'))
-        
         return {
             "name": i.get('longName', symbol),
             "sector": sector,
@@ -94,10 +100,8 @@ def get_fundamentals(symbol):
 
 def get_ai_analysis(symbol, pipeline):
     if not pipeline: return "Neutral", 0, []
-    
     base = symbol.replace(".DE", "")
     t = yf.Ticker(base)
-    
     try:
         news = t.news
         headlines = []
@@ -121,7 +125,6 @@ def get_ai_analysis(symbol, pipeline):
 # --- APP START ---
 st.title("🧠 Master AI Investment Terminal")
 
-# Jetzt funktioniert der Aufruf, weil die Funktion oben repariert ist
 real_symbol, _ = get_symbol_and_currency(ticker_input, market_mode)
 
 if st.button("Vollanalyse starten 🚀"):
@@ -154,6 +157,7 @@ if st.button("Vollanalyse starten 🚀"):
 
         st.divider()
 
+        # --- SCORE LOGIK ---
         score = 0
         reasons_pro = []
         reasons_con = []
@@ -171,18 +175,18 @@ if st.button("Vollanalyse starten 🚀"):
                     score -= 2
                     reasons_con.append("Abwärtstrend (No-Go für Long-Term)")
 
-        # 2. Bollinger Rebound
+        # 2. Bollinger
         if last['Close'] > last['BB_UPPER']:
             reasons_con.append("Am oberen Band (Überhitzt)")
             if strategy_mode == "Swing Trading (Kurz)": score -= 2
-        elif last['Close'] <= last['BB_LOWER'] * 1.01:
+        elif last['Close'] <= last['BB_LOWER'] * 1.02: # 2% Toleranz für bessere Treffer!
             reasons_pro.append("Am unteren Band (Rebound Chance)")
             if strategy_mode == "Swing Trading (Kurz)": score += 3 
             else: score += 1
 
         # 3. RSI
-        if last['RSI'] < 30:
-            reasons_pro.append(f"RSI Panik ({last['RSI']:.0f})")
+        if last['RSI'] < 35: # Schwelle erhöht auf 35 für mehr Signale
+            reasons_pro.append(f"RSI günstig ({last['RSI']:.0f})")
             score += 1
         elif last['RSI'] > 70:
             reasons_con.append(f"RSI Hype ({last['RSI']:.0f})")
@@ -204,39 +208,49 @@ if st.button("Vollanalyse starten 🚀"):
             st.error("❌ BEARISH")
             for r in reasons_con: st.write(f"• {r}")
             
-        with st.expander("📰 Gelesene Schlagzeilen ansehen"):
+        with st.expander("📰 News Details"):
             for h in headlines: st.write(f"- {h}")
 
         st.subheader("📊 Profi-Chart")
         fig = go.Figure(data=[go.Candlestick(x=df.index,
                         open=df['Open'], high=df['High'],
                         low=df['Low'], close=df['Close'], name="Kurs")])
-        
         fig.add_trace(go.Scatter(x=df.index, y=df['BB_UPPER'], line=dict(color='gray', width=1), name="Upper Band"))
         fig.add_trace(go.Scatter(x=df.index, y=df['BB_LOWER'], line=dict(color='gray', width=1), name="Lower Band"))
         fig.add_trace(go.Scatter(x=df.index, y=df['SMA200'], line=dict(color='blue', width=2), name="SMA 200"))
-        
         fig.update_layout(height=500, xaxis_rangeslider_visible=False, template="plotly_dark")
         st.plotly_chart(fig, use_container_width=True)
 
         st.divider()
         st.subheader("📋 Trading Plan (in Euro)")
         
+        # --- DYNAMISCHE SCHWELLENWERTE (Das ist der Trick!) ---
+        # Je aggressiver du bist, desto niedriger ist die Hürde für ein "KAUFEN"
+        min_score_long = 2.0 # Standard
+        min_score_short = -2.0 # Standard
+        
+        if aggro_mode == "Sicherheits-Fanatiker 🛡️":
+            min_score_long = 3.0
+            min_score_short = -3.0
+        elif aggro_mode == "Risiko-Freudig (Degen) 🚀":
+            min_score_long = 0.5 # Fast alles wird gekauft!
+            min_score_short = -0.5
+        
         action = "WARTEN"
         tp_orig = last['Close']
         sl_orig = last['Close']
         
         if strategy_mode == "Swing Trading (Kurz)":
-            if score >= 1.5:
-                action = "LONG (Rebound)"
+            if score >= min_score_long:
+                action = "LONG (Kaufen)"
                 tp_orig = last['SMA50'] if pd.notna(last['SMA50']) else last['BB_UPPER']
                 sl_orig = last['BB_LOWER'] * 0.98
-            elif score <= -1.5:
+            elif score <= min_score_short:
                 action = "SHORT"
                 tp_orig = last['BB_LOWER']
                 sl_orig = last['BB_UPPER'] * 1.02
         else:
-            if score >= 3:
+            if score >= (min_score_long + 1): # Investing braucht immer etwas mehr Sicherheit
                 action = "INVESTIEREN"
                 tp_orig = fund['target'] if fund['target'] > 0 else last['Close']*1.3
                 sl_orig = last['Close'] * 0.85
@@ -256,9 +270,13 @@ if st.button("Vollanalyse starten 🚀"):
         budget = konto * (risk_pct / 100)
         qty = math.floor(budget / risk) if risk > 0 else 0
         
+        # CRV Filter lockern im Aggro-Modus
+        min_crv = 1.2
+        if "Risiko-Freudig" in aggro_mode: min_crv = 0.8 # Wir akzeptieren auch schlechtere Wetten
+
         if action == "WARTEN":
-            st.warning("✋ Keine klare Chance (Score zu niedrig)")
-        elif crv < 1.2:
+            st.warning(f"✋ Keine Chance (Score {score} ist zu schwach für '{aggro_mode}')")
+        elif crv < min_crv:
             st.warning(f"✋ Signal {action}, aber CRV ({crv:.2f}) lohnt nicht.")
         else:
             color = "red" if "SHORT" in action else "green"
@@ -273,7 +291,8 @@ if st.button("Vollanalyse starten 🚀"):
             st.info(f"💰 Invest: {qty*curr_eur:.2f} € (Risiko: {budget:.2f} €)")
 
     else:
-        st.error("Fehler beim Laden. Symbol prüfen!")
+        st.error("Fehler beim Laden.")
+
 
 
 
